@@ -12,6 +12,8 @@ Este repositorio es un detector de objetos sin anclas, escrito de forma independ
 
 El código de este repositorio usa la licencia MIT. El código de Ultralytics no está incluido. Cita este proyecto como una implementación independiente.
 
+La versión actual del código es la 0.2.0. Esta versión cambia la red: un punto de control de la 0.1.0 no se puede cargar y hay que volver a entrenar.
+
 ## Lugar entre las familias YOLO públicas
 
 | Versión | Estado | Ideas de detección descritas en público |
@@ -28,7 +30,7 @@ El código de este repositorio usa la licencia MIT. El código de Ultralytics no
 | YOLO12 | Modelo comunitario | Backbone centrado en la atención |
 | YOLO26 | Publicada en enero de 2026 | Se quitó DFL; cabeza de extremo a extremo opcional, sin NMS |
 | YOLO27 | Vista previa, pesos sin publicar | Los modelos pequeños usan dos escalas; los grandes, decodificación por consultas |
-| Este repo | Código independiente | GateCSP, distancias de caja con softplus, cabeza de doble asignación |
+| Este repo | Código independiente 0.2.0 | MixUnit 3×3/5×5, StripGate, distancias de caja con softplus, cabeza de doble asignación |
 
 La documentación de Ultralytics marca YOLO12 como modelo comunitario y presenta YOLO26 como la familia actual para un trabajo nuevo.
 
@@ -37,7 +39,8 @@ La documentación de Ultralytics marca YOLO12 como modelo comunitario y presenta
 El alto y el ancho de la entrada tienen que ser múltiplos de 32. Los tres pasos de detección son 8, 16 y 32.
 
 - El tallo hace dos convoluciones de paso 2 y después entra en GateCSP.
-- MixUnit resta un contexto de pooling medio 3×3 a un camino local depthwise 3×3. El sesgo de la compuerta empieza en -4, así que la sigmoide queda cerca de 0 y el residual empieza cerca de la identidad.
+- MixUnit mezcla, con un softmax y por canal, una convolución depthwise 3×3 y otra 5×5, y después resta un contexto de pooling medio 3×3. El sesgo de la compuerta residual empieza en -4, así que el bloque empieza cerca de la identidad.
+- Cada una de las tres escalas de detección pasa por un StripGate antes de la cabeza. La compuerta sale de una media horizontal y una media vertical. Su sesgo empieza en 4, así que arranca casi abierta.
 - GateCSP parte los canales: una rama apila bloques MixUnit, la otra pasa directa, y luego se unen.
 - El mapa de menor resolución pasa por PyramidPool: tres max-pools 5×5 en serie, concatenados con las características sin pooling.
 - El cuello es un PAN de P3, P4 y P5.
@@ -90,7 +93,7 @@ Cada fila de etiqueta es `clase xc yc w h`. Los cuatro valores de la caja están
 python -m yolov28.train --data configs/dataset.example.yaml --scale n --epochs 100 --batch 8 --imgsz 640
 ```
 
-El aumento de este bucle es un volteo horizontal aleatorio más letterbox. Mosaic no entra en el bucle. La tasa de aprendizaje es `0.001`, el weight decay es `0.0005` y los gradientes se recortan en 10. Con más de una época, las 3 primeras suben de forma lineal y el resto sigue un descenso en coseno. Una sola época usa directamente la tasa base. La ganancia de caja es 2.0, la de clasificación es 0.5 y la rama de uno a uno se multiplica por 1.0. Si hay conjunto de validación, `best.pt` se elige por la mAP50 de validación.
+El aumento incluye mosaic en cerca del 75 % de las muestras, un volteo horizontal aleatorio, HSV y letterbox. Si el entrenamiento dura al menos 10 épocas, el mosaic se apaga en el último 10 %. `--demo` no usa mosaic, y `--no-mosaic` lo desactiva en un conjunto real. La validación y los archivos `last.pt` y `best.pt` usan una media móvil exponencial de los pesos, con decaimiento 0.999. La tasa de aprendizaje es `0.001`, el weight decay es `0.0005` y los gradientes se recortan en 10. Con más de una época, las 3 primeras suben de forma lineal y el resto sigue un descenso en coseno. Una sola época usa directamente la tasa base. La ganancia de caja es 2.0, la de clasificación es 0.5 y la rama de uno a uno se multiplica por 1.0. Si hay conjunto de validación, `best.pt` se elige por la mAP50-95 de validación.
 
 `--scale` acepta `n`, `s`, `m`, `l` o `x`.
 
@@ -136,15 +139,15 @@ Las cifras de parámetros son para 80 clases y salen de `python -m yolov28.summa
 
 | Escala | Profundidad | Anchura | Parámetros con 80 clases |
 | --- | ---: | ---: | ---: |
-| n | 0.33 | 0.25 | 1,789,192 |
-| s | 0.33 | 0.50 | 6,163,224 |
-| m | 0.67 | 0.75 | 14,573,736 |
-| l | 1.00 | 1.00 | 27,206,712 |
-| x | 1.33 | 1.25 | 44,564,424 |
+| n | 0.33 | 0.25 | 1,896,568 |
+| s | 0.33 | 0.50 | 6,563,320 |
+| m | 0.67 | 0.75 | 15,997,320 |
+| l | 1.00 | 1.00 | 30,649,208 |
+| x | 1.33 | 1.25 | 51,356,104 |
 
 ## Métrica de validación
 
-La mAP50 del registro es la precisión media con IoU 0.5. Las clases sin verdad de referencia en la validación quedan fuera de la media. La mAP al estilo COCO promedia umbrales de IoU desde 0.50 hasta 0.95. El número que se imprime aquí es el resultado de un solo umbral.
+La mAP50 del registro es la precisión media con IoU 0.5. La mAP50-95 promedia los diez umbrales de 0.50 a 0.95 con paso 0.05. Las clases sin verdad de referencia en la validación quedan fuera de la media. `best.pt` se elige por la mAP50-95.
 
 ## Pruebas
 

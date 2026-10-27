@@ -19,16 +19,35 @@ def letterbox(
     image: Image.Image, size: int, color: Tuple[int, int, int] = (114, 114, 114)
 ) -> Tuple[Image.Image, float, int, int]:
     """Resize ``image`` to fit in a square canvas. Returns canvas, scale, left, top."""
+    return fit_image(image, size, size, color)
+
+
+def fit_image(
+    image: Image.Image,
+    box_w: int,
+    box_h: int,
+    color: Tuple[int, int, int] = (114, 114, 114),
+) -> Tuple[Image.Image, float, int, int]:
+    """Fit ``image`` inside a ``box_w`` by ``box_h`` canvas. Returns canvas, scale, left, top."""
     width, height = image.size
-    scale = min(size / width, size / height)
-    resized_w = int(round(width * scale))
-    resized_h = int(round(height * scale))
+    scale = min(box_w / width, box_h / height)
+    resized_w = min(box_w, max(1, int(round(width * scale))))
+    resized_h = min(box_h, max(1, int(round(height * scale))))
     resized = image.resize((resized_w, resized_h), Image.BILINEAR)
-    canvas = Image.new("RGB", (size, size), color)
-    left = (size - resized_w) // 2
-    top = (size - resized_h) // 2
+    canvas = Image.new("RGB", (box_w, box_h), color)
+    left = (box_w - resized_w) // 2
+    top = (box_h - resized_h) // 2
     canvas.paste(resized, (left, top))
     return canvas, scale, left, top
+
+
+def shift_hsv(image: Image.Image) -> Image.Image:
+    """Small random hue, saturation, and value shift. PIL hue wraps at 256."""
+    hsv = np.asarray(image.convert("HSV"), dtype=np.int16)
+    hsv[..., 0] = (hsv[..., 0] + random.randint(-8, 8)) % 256
+    hsv[..., 1] = np.clip(hsv[..., 1] * random.uniform(0.6, 1.4), 0, 255)
+    hsv[..., 2] = np.clip(hsv[..., 2] * random.uniform(0.6, 1.4), 0, 255)
+    return Image.fromarray(hsv.astype(np.uint8), mode="HSV").convert("RGB")
 
 
 def xywhn_to_xyxy(
@@ -133,10 +152,11 @@ def label_path_for(root: Path, image_path: Path) -> Path:
 
 
 class DetectionDataset(Dataset):
-    def __init__(self, root: Path, split: str, imgsz: int, augment: bool, nc: int):
+    def __init__(self, root: Path, split: str, imgsz: int, augment: bool, nc: int, mosaic: bool = True):
         self.root = Path(root)
         self.imgsz = imgsz
         self.augment = augment
+        self.mosaic = mosaic
         self.nc = nc
         split_root = self.root / split
         if not split_root.is_dir():
@@ -156,18 +176,64 @@ class DetectionDataset(Dataset):
     def __len__(self) -> int:
         return len(self.files)
 
-    def __getitem__(self, index: int):
+    def _load(self, index: int) -> Tuple[Image.Image, torch.Tensor]:
         path = self.files[index]
         with Image.open(path) as handle:
             image = handle.convert("RGB")
             image.load()
-        width, height = image.size
         labels = read_label_file(label_path_for(self.root, path))
+        return image, labels
+
+    def _single(self, index: int) -> Tuple[Image.Image, torch.Tensor]:
+        image, labels = self._load(index)
+        width, height = image.size
         image, scale, left, top = letterbox(image, self.imgsz)
         boxes = xywhn_to_xyxy(labels, width, height, scale, left, top)
+        return image, boxes
+
+    def _mosaic(self, index: int) -> Tuple[Image.Image, torch.Tensor]:
+        """Paste four images into one square, split around a random center."""
+        size = self.imgsz
+        center_x = random.randint(size // 4, (size * 3) // 4)
+        center_y = random.randint(size // 4, (size * 3) // 4)
+        canvas = Image.new("RGB", (size, size), (114, 114, 114))
+        quadrants = (
+            (0, 0, center_x, center_y),
+            (center_x, 0, size - center_x, center_y),
+            (0, center_y, center_x, size - center_y),
+            (center_x, center_y, size - center_x, size - center_y),
+        )
+        indexes = [index] + [random.randrange(len(self.files)) for _ in range(3)]
+        collected: List[torch.Tensor] = []
+        for (origin_x, origin_y, tile_w, tile_h), sample_index in zip(quadrants, indexes):
+            if tile_w < 2 or tile_h < 2:
+                continue
+            image, labels = self._load(sample_index)
+            width, height = image.size
+            tile, scale, left, top = fit_image(image, tile_w, tile_h)
+            canvas.paste(tile, (origin_x, origin_y))
+            boxes = xywhn_to_xyxy(labels, width, height, scale, left, top)
+            if boxes.numel():
+                boxes = boxes.clone()
+                boxes[:, 1] += origin_x
+                boxes[:, 3] += origin_x
+                boxes[:, 2] += origin_y
+                boxes[:, 4] += origin_y
+                collected.append(boxes)
+        if collected:
+            return canvas, torch.cat(collected, dim=0)
+        return canvas, torch.zeros((0, 5), dtype=torch.float32)
+
+    def __getitem__(self, index: int):
+        if self.augment and self.mosaic and random.random() < 0.75:
+            image, boxes = self._mosaic(index)
+        else:
+            image, boxes = self._single(index)
         if self.augment and random.random() < 0.5:
             image = image.transpose(Image.FLIP_LEFT_RIGHT)
             boxes = flip_boxes(boxes, self.imgsz)
+        if self.augment:
+            image = shift_hsv(image)
         boxes = clamp_boxes(boxes, self.imgsz)
         if boxes.numel():
             keep = (boxes[:, 0] >= 0) & (boxes[:, 0] < self.nc)

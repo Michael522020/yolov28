@@ -12,6 +12,8 @@ Ce dépôt est un détecteur d'objets sans ancres, écrit de façon indépendant
 
 Le code de ce dépôt est sous licence MIT. Le code source d'Ultralytics n'y figure pas. Citez ce projet comme une implémentation indépendante.
 
+La version actuelle du code est la 0.2.0. Cette version change le réseau : un point de contrôle 0.1.0 ne se charge pas, il faut réentraîner.
+
 ## Place parmi les familles YOLO publiques
 
 | Version | État | Idées de détection décrites publiquement |
@@ -28,7 +30,7 @@ Le code de ce dépôt est sous licence MIT. Le code source d'Ultralytics n'y fig
 | YOLO12 | Modèle communautaire | Backbone centré sur l'attention |
 | YOLO26 | Publiée en janvier 2026 | DFL retiré ; tête de bout en bout optionnelle, sans NMS |
 | YOLO27 | Aperçu, poids non publiés | Les petits modèles utilisent deux échelles ; les plus grands, un décodage par requêtes |
-| Ce dépôt | Code indépendant | GateCSP, distances de boîte en softplus, tête à double assignation |
+| Ce dépôt | Code indépendant 0.2.0 | MixUnit 3×3/5×5, StripGate, distances de boîte en softplus, tête à double assignation |
 
 La documentation Ultralytics présente YOLO12 comme un modèle communautaire et YOLO26 comme la famille actuelle pour un nouveau travail.
 
@@ -37,7 +39,8 @@ La documentation Ultralytics présente YOLO12 comme un modèle communautaire et 
 La hauteur et la largeur d'entrée doivent être des multiples de 32. Les trois pas de détection sont 8, 16 et 32.
 
 - La tige fait deux convolutions de pas 2, puis entre dans GateCSP.
-- MixUnit soustrait un contexte de pooling moyen 3×3 à un chemin local en convolution depthwise 3×3. Le biais de la porte vaut -4 au départ, donc le sigmoïde est proche de 0 et le résidu commence près de l'identité.
+- MixUnit mélange, par un softmax et par canal, une convolution depthwise 3×3 et une 5×5, puis soustrait un contexte de pooling moyen 3×3. Le biais de la porte résiduelle vaut -4 au départ, donc le bloc commence près de l'identité.
+- Chacune des trois échelles de détection passe par un StripGate avant la tête. La porte est faite d'une moyenne horizontale et d'une moyenne verticale. Son biais vaut 4 au départ, elle est donc presque ouverte.
 - GateCSP sépare les canaux : une branche empile des MixUnit, l'autre passe telle quelle, puis les deux sont fusionnées.
 - La carte de plus basse résolution passe par PyramidPool : trois max-pools 5×5 en série, concaténés aux caractéristiques non poolées.
 - Le cou est un PAN sur P3, P4 et P5.
@@ -90,7 +93,7 @@ Chaque ligne d'étiquette est `classe xc yc w h`. Les quatre valeurs de boîte s
 python -m yolov28.train --data configs/dataset.example.yaml --scale n --epochs 100 --batch 8 --imgsz 640
 ```
 
-L'augmentation de cette boucle est un retournement horizontal aléatoire plus un letterbox. Mosaic n'en fait pas partie. Le taux d'apprentissage vaut `0.001`, le weight decay `0.0005`, et les gradients sont coupés à 10. Au-delà d'une époque, les 3 premières montent linéairement, puis une décroissance en cosinus prend le relais. Une seule époque utilise directement le taux de base. Le gain de boîte est 2.0, le gain de classification 0.5, et la branche un-vers-un est multipliée par 1.0. S'il existe un jeu de validation, `best.pt` est choisi selon la mAP50 de validation.
+L'augmentation comprend un mosaic sur environ 75 % des échantillons, un retournement horizontal aléatoire, le HSV et un letterbox. À partir de 10 époques, le mosaic est coupé pendant les 10 % dernières. `--demo` ne fait pas de mosaic, et `--no-mosaic` le désactive sur un vrai jeu. La validation ainsi que `last.pt` et `best.pt` utilisent une moyenne mobile exponentielle des poids, avec un decay de 0.999. Le taux d'apprentissage vaut `0.001`, le weight decay `0.0005`, et les gradients sont coupés à 10. Au-delà d'une époque, les 3 premières montent linéairement, puis une décroissance en cosinus prend le relais. Une seule époque utilise directement le taux de base. Le gain de boîte est 2.0, le gain de classification 0.5, et la branche un-vers-un est multipliée par 1.0. S'il existe un jeu de validation, `best.pt` est choisi selon la mAP50-95 de validation.
 
 `--scale` accepte `n`, `s`, `m`, `l` ou `x`.
 
@@ -136,15 +139,15 @@ Les nombres de paramètres ci-dessous valent pour 80 classes et viennent de `pyt
 
 | Échelle | Profondeur | Largeur | Paramètres à 80 classes |
 | --- | ---: | ---: | ---: |
-| n | 0.33 | 0.25 | 1,789,192 |
-| s | 0.33 | 0.50 | 6,163,224 |
-| m | 0.67 | 0.75 | 14,573,736 |
-| l | 1.00 | 1.00 | 27,206,712 |
-| x | 1.33 | 1.25 | 44,564,424 |
+| n | 0.33 | 0.25 | 1,896,568 |
+| s | 0.33 | 0.50 | 6,563,320 |
+| m | 0.67 | 0.75 | 15,997,320 |
+| l | 1.00 | 1.00 | 30,649,208 |
+| x | 1.33 | 1.25 | 51,356,104 |
 
 ## Métrique de validation
 
-La mAP50 du journal est la précision moyenne à un IoU de 0.5. Les classes sans vérité terrain dans le jeu de validation sont exclues de la moyenne. La mAP de style COCO moyenne les seuils d'IoU de 0.50 à 0.95. Le nombre affiché ici est le résultat à un seul seuil.
+La mAP50 du journal est la précision moyenne à un IoU de 0.5. La mAP50-95 moyenne les dix seuils de 0.50 à 0.95 par pas de 0.05. Les classes sans vérité terrain dans le jeu de validation sont exclues de la moyenne. `best.pt` est choisi selon la mAP50-95.
 
 ## Tests
 

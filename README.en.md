@@ -12,6 +12,8 @@ This repository is an independent anchor-free object detector: model, loss, trai
 
 The code in this repository is MIT licensed. Ultralytics source is not included. Cite this project as an independent implementation.
 
+The current code version is 0.2.0. This version changes the network, so a 0.1.0 checkpoint cannot be loaded and training has to start again.
+
 ## Where it sits among public YOLO families
 
 | Version | Status | Public detection ideas associated with it |
@@ -28,7 +30,7 @@ The code in this repository is MIT licensed. Ultralytics source is not included.
 | YOLO12 | Community model | Attention-centric backbone |
 | YOLO26 | Released January 2026 | DFL removed; optional end-to-end head that skips NMS |
 | YOLO27 | Preview, weights unreleased | Compact models use two detection scales; larger models use query decoding |
-| This repo | Independent code | GateCSP, softplus box distances, dual-assignment head |
+| This repo | Independent code 0.2.0 | 3×3/5×5 MixUnit, StripGate, softplus box distances, dual-assignment head |
 
 Ultralytics docs mark YOLO12 as a community model and present YOLO26 as the current release for new work.
 
@@ -37,7 +39,8 @@ Ultralytics docs mark YOLO12 as a community model and present YOLO26 as the curr
 Input height and width must both be multiples of 32. The three detection strides are 8, 16, and 32.
 
 - The stem is two stride-2 convolutions, followed by GateCSP.
-- MixUnit subtracts a 3×3 average-pooled context from a depthwise 3×3 local path. The gate bias starts at -4, so the sigmoid is near 0 and the residual starts close to an identity.
+- MixUnit uses a softmax to blend depthwise 3×3 and 5×5 responses per channel, then subtracts a 3×3 average-pooled context. The residual gate bias starts at -4, so the block starts close to an identity.
+- Each of the three detection scales passes through a StripGate before the head. The gate is built from a horizontal average and a vertical average. Its bias starts at 4, so it starts nearly open.
 - GateCSP splits channels into two parts: one part stacks MixUnit blocks, the other passes through, and the parts are merged.
 - The lowest-resolution map goes through PyramidPool: three serial 5×5 max-pools concatenated with the unpooled features.
 - The neck is a P3 / P4 / P5 PAN.
@@ -90,7 +93,7 @@ Each label row is `class xc yc w h`, with the four box values normalized by the 
 python -m yolov28.train --data configs/dataset.example.yaml --scale n --epochs 100 --batch 8 --imgsz 640
 ```
 
-Augmentation in this loop is a random horizontal flip plus letterbox. Mosaic is not part of the loop. The default learning rate is `0.001`, weight decay is `0.0005`, and gradients are clipped at 10. With more than one epoch, the first 3 epochs warm up linearly and the rest follow a cosine decay. A single-epoch run uses the base learning rate directly. The box loss gain is 2.0, the classification gain is 0.5, and the one-to-one branch is multiplied by 1.0. When a validation set exists, `best.pt` is chosen by validation mAP50.
+Augmentation is mosaic on about 75% of samples, a random horizontal flip, HSV, and letterbox. When training runs for at least 10 epochs, mosaic turns off for the last 10% of epochs. `--demo` skips mosaic, and `--no-mosaic` turns it off for a real dataset. Validation and the saved `last.pt` / `best.pt` files use an exponential moving average of the weights with decay 0.999. The default learning rate is `0.001`, weight decay is `0.0005`, and gradients are clipped at 10. With more than one epoch, the first 3 epochs warm up linearly and the rest follow a cosine decay. A single-epoch run uses the base learning rate directly. The box loss gain is 2.0, the classification gain is 0.5, and the one-to-one branch is multiplied by 1.0. When a validation set exists, `best.pt` is chosen by validation mAP50-95.
 
 `--scale` accepts `n`, `s`, `m`, `l`, or `x`.
 
@@ -136,15 +139,15 @@ Parameter counts below are for 80 classes, measured with `python -m yolov28.summ
 
 | Scale | Depth | Width | Parameters at 80 classes |
 | --- | ---: | ---: | ---: |
-| n | 0.33 | 0.25 | 1,789,192 |
-| s | 0.33 | 0.50 | 6,163,224 |
-| m | 0.67 | 0.75 | 14,573,736 |
-| l | 1.00 | 1.00 | 27,206,712 |
-| x | 1.33 | 1.25 | 44,564,424 |
+| n | 0.33 | 0.25 | 1,896,568 |
+| s | 0.33 | 0.50 | 6,563,320 |
+| m | 0.67 | 0.75 | 15,997,320 |
+| l | 1.00 | 1.00 | 30,649,208 |
+| x | 1.33 | 1.25 | 51,356,104 |
 
 ## Validation metric
 
-mAP50 in the log is average precision at IoU 0.5. Classes with no ground truth in the validation set are left out of the mean. The COCO-style mAP averages IoU thresholds from 0.50 through 0.95. The number printed here is the single-threshold result.
+mAP50 in the log is average precision at IoU 0.5. mAP50-95 averages the ten thresholds from 0.50 to 0.95 in steps of 0.05. Classes with no ground truth in the validation set are left out of the mean. `best.pt` is selected by mAP50-95.
 
 ## Tests
 

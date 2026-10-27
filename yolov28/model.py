@@ -42,24 +42,28 @@ class Conv(nn.Module):
 class MixUnit(nn.Module):
     """Residual mixer.
 
-    A depthwise local path is compared with a pooled context path. The gate
-    bias starts at -4, so the block is close to an identity residual at step 0.
+    A softmax blends depthwise 3x3 and 5x5 responses per channel. That local
+    mix is compared with a pooled context path. The residual gate bias starts
+    at -4, so the block is close to an identity residual at step 0.
     """
 
     def __init__(self, channels: int):
         super().__init__()
-        self.local = nn.Sequential(
-            Conv(channels, channels, 3, g=channels),
-            Conv(channels, channels, 1),
-        )
+        self.local3 = Conv(channels, channels, 3, g=channels)
+        self.local5 = Conv(channels, channels, 5, g=channels)
+        self.project = Conv(channels, channels, 1)
         self.context = nn.Sequential(
             nn.AvgPool2d(kernel_size=3, stride=1, padding=1),
             Conv(channels, channels, 1),
         )
+        self.mix = nn.Conv2d(channels, channels * 2, 1, bias=True)
         self.gate = nn.Conv2d(channels, channels, 1, bias=True)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        delta = self.local(x) - self.context(x)
+        batch, channels, height, width = x.shape
+        mix = self.mix(x).view(batch, 2, channels, height, width).softmax(dim=1)
+        local = self.project(mix[:, 0] * self.local3(x) + mix[:, 1] * self.local5(x))
+        delta = local - self.context(x)
         return x + torch.sigmoid(self.gate(x)) * delta
 
 
@@ -76,6 +80,23 @@ class GateCSP(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         a, b = self.cv1(x).chunk(2, dim=1)
         return self.cv2(torch.cat((self.m(a), b), dim=1))
+
+
+class StripGate(nn.Module):
+    """Spatial gate from horizontal and vertical averages.
+
+    The bias starts at 4, so the gate is nearly open and the block starts
+    close to an identity.
+    """
+
+    def __init__(self, channels: int):
+        super().__init__()
+        self.conv = nn.Conv2d(channels, channels, 1, bias=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        horizontal = x.mean(dim=3, keepdim=True)
+        vertical = x.mean(dim=2, keepdim=True)
+        return x * torch.sigmoid(self.conv(horizontal + vertical))
 
 
 class PyramidPool(nn.Module):
@@ -197,6 +218,9 @@ class YOLOv28(nn.Module):
         self.pan4 = GateCSP(c2 + c3, c3, repeats(3))
         self.down5 = Conv(c3, c3, 3, 2)
         self.pan5 = GateCSP(c3 + c4, c4, repeats(3))
+        self.p3_gate = StripGate(c2)
+        self.p4_gate = StripGate(c3)
+        self.p5_gate = StripGate(c4)
         self.detect = Detect(nc, (c2, c3, c4))
         self._init_weights()
         self.detect.bias_init()
@@ -213,8 +237,13 @@ class YOLOv28(nn.Module):
                 nn.init.zeros_(module.bias)
         for module in self.modules():
             if isinstance(module, MixUnit):
+                nn.init.zeros_(module.mix.weight)
+                nn.init.zeros_(module.mix.bias)
                 nn.init.zeros_(module.gate.weight)
                 nn.init.constant_(module.gate.bias, -4.0)
+            elif isinstance(module, StripGate):
+                nn.init.zeros_(module.conv.weight)
+                nn.init.constant_(module.conv.bias, 4.0)
 
     def _init_strides(self) -> None:
         training = self.training
@@ -242,7 +271,7 @@ class YOLOv28(nn.Module):
         n3 = self.lat4(_same_size_cat(F.interpolate(n4, scale_factor=2, mode="nearest"), p3))
         d4 = self.pan4(_same_size_cat(self.down4(n3), n4))
         d5 = self.pan5(_same_size_cat(self.down5(d4), p5))
-        return self.detect([n3, d4, d5])
+        return self.detect([self.p3_gate(n3), self.p4_gate(d4), self.p5_gate(d5)])
 
     def extra_repr(self) -> str:
         return f"nc={self.nc}, scale={self.scale}"

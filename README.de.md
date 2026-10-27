@@ -12,6 +12,8 @@ Dieses Repository ist ein unabhängiger ankerfreier Objektdetektor: Netz, Verlus
 
 Der Code in diesem Repository steht unter der MIT-Lizenz. Ultralytics-Quelltext ist nicht enthalten. Zitiere das Projekt als unabhängige Implementierung.
 
+Die aktuelle Codeversion ist 0.2.0. Diese Version ändert das Netz, deshalb lässt sich ein Checkpoint von 0.1.0 nicht laden und das Training muss neu beginnen.
+
 ## Einordnung zu den öffentlichen YOLO-Familien
 
 | Version | Status | Öffentlich beschriebene Ideen zur Detektion |
@@ -28,7 +30,7 @@ Der Code in diesem Repository steht unter der MIT-Lizenz. Ultralytics-Quelltext 
 | YOLO12 | Community-Modell | Aufmerksamkeit im Backbone |
 | YOLO26 | Veröffentlicht im Januar 2026 | DFL entfernt; optionaler End-to-End-Kopf ohne NMS |
 | YOLO27 | Vorschau, Gewichte nicht veröffentlicht | Kompakte Modelle nutzen zwei Detektionsskalen; größere Modelle eine Query-Decodierung |
-| Dieses Repo | Unabhängiger Code | GateCSP, Softplus-Boxabstände, Kopf mit doppelter Zuordnung |
+| Dieses Repo | Unabhängiger Code 0.2.0 | 3×3/5×5-MixUnit, StripGate, Softplus-Boxabstände, Kopf mit doppelter Zuordnung |
 
 Die Ultralytics-Dokumentation führt YOLO12 als Community-Modell und YOLO26 als aktuelle Fassung für neue Arbeiten.
 
@@ -37,7 +39,8 @@ Die Ultralytics-Dokumentation führt YOLO12 als Community-Modell und YOLO26 als 
 Höhe und Breite der Eingabe müssen Vielfache von 32 sein. Die drei Detektionsschritte sind 8, 16 und 32.
 
 - Der Stamm besteht aus zwei Faltungen mit Schritt 2, danach folgt GateCSP.
-- MixUnit zieht einen 3×3-Mittelwertkontext von einem tiefenseparierten 3×3-Pfad ab. Der Gate-Bias startet bei -4, der Sigmoid liegt nahe 0, und das Residuum beginnt nahe an der Identität.
+- MixUnit mischt tiefenseparierte 3×3- und 5×5-Antworten pro Kanal mit einem Softmax und zieht danach einen 3×3-Mittelwertkontext ab. Der Bias des Residuen-Gates startet bei -4, der Block beginnt also nahe an der Identität.
+- Jede der drei Detektionsskalen geht vor dem Kopf durch ein StripGate. Das Gate entsteht aus einem horizontalen und einem vertikalen Mittelwert. Sein Bias startet bei 4, das Gate ist anfangs also fast offen.
 - GateCSP teilt die Kanäle: ein Teil stapelt MixUnit-Blöcke, der andere läuft durch, danach werden beide zusammengeführt.
 - Die gröbste Karte geht durch PyramidPool: drei serielle 5×5-Max-Pools, verkettet mit den ungepoolten Merkmalen.
 - Der Hals ist ein PAN über P3, P4 und P5.
@@ -90,7 +93,7 @@ Jede Beschriftungszeile ist `Klasse xc yc w h`. Die vier Boxwerte sind auf Breit
 python -m yolov28.train --data configs/dataset.example.yaml --scale n --epochs 100 --batch 8 --imgsz 640
 ```
 
-Die Augmentierung in dieser Schleife ist eine zufällige horizontale Spiegelung plus Letterbox. Mosaic gehört nicht dazu. Die Lernrate ist `0.001`, der Weight Decay `0.0005`, Gradienten werden bei 10 beschnitten. Bei mehr als einer Epoche wärmen die ersten 3 Epochen linear auf, danach folgt ein Kosinusabfall. Ein Lauf mit einer Epoche nutzt direkt die Basislernrate. Der Box-Gewinn ist 2.0, der Klassengewinn 0.5, der Eins-zu-eins-Zweig wird mit 1.0 multipliziert. Gibt es eine Validierungsmenge, wird `best.pt` nach der Validierungs-mAP50 gewählt.
+Die Augmentierung umfasst Mosaic bei etwa 75 % der Proben, eine zufällige horizontale Spiegelung, HSV und Letterbox. Ab 10 Epochen ist Mosaic in den letzten 10 % der Epochen aus. `--demo` verwendet kein Mosaic, `--no-mosaic` schaltet es für echte Daten ab. Validierung sowie `last.pt` und `best.pt` nutzen einen exponentiellen gleitenden Mittelwert der Gewichte mit Decay 0.999. Die Lernrate ist `0.001`, der Weight Decay `0.0005`, Gradienten werden bei 10 beschnitten. Bei mehr als einer Epoche wärmen die ersten 3 Epochen linear auf, danach folgt ein Kosinusabfall. Ein Lauf mit einer Epoche nutzt direkt die Basislernrate. Der Box-Gewinn ist 2.0, der Klassengewinn 0.5, der Eins-zu-eins-Zweig wird mit 1.0 multipliziert. Gibt es eine Validierungsmenge, wird `best.pt` nach der Validierungs-mAP50-95 gewählt.
 
 `--scale` akzeptiert `n`, `s`, `m`, `l` oder `x`.
 
@@ -136,15 +139,15 @@ Die Parameterzahlen gelten für 80 Klassen und stammen von `python -m yolov28.su
 
 | Größe | Tiefe | Breite | Parameter bei 80 Klassen |
 | --- | ---: | ---: | ---: |
-| n | 0.33 | 0.25 | 1,789,192 |
-| s | 0.33 | 0.50 | 6,163,224 |
-| m | 0.67 | 0.75 | 14,573,736 |
-| l | 1.00 | 1.00 | 27,206,712 |
-| x | 1.33 | 1.25 | 44,564,424 |
+| n | 0.33 | 0.25 | 1,896,568 |
+| s | 0.33 | 0.50 | 6,563,320 |
+| m | 0.67 | 0.75 | 15,997,320 |
+| l | 1.00 | 1.00 | 30,649,208 |
+| x | 1.33 | 1.25 | 51,356,104 |
 
 ## Validierungsmetrik
 
-mAP50 im Log ist die durchschnittliche Präzision bei IoU 0.5. Klassen ohne Ground Truth in der Validierungsmenge gehen nicht in den Mittelwert ein. Das COCO-übliche mAP mittelt IoU-Schwellen von 0.50 bis 0.95. Die hier ausgegebene Zahl ist das Ergebnis bei einer einzigen Schwelle.
+mAP50 im Log ist die durchschnittliche Präzision bei IoU 0.5. mAP50-95 mittelt die zehn Schwellen von 0.50 bis 0.95 in Schritten von 0.05. Klassen ohne Ground Truth in der Validierungsmenge gehen nicht in den Mittelwert ein. `best.pt` wird nach mAP50-95 gewählt.
 
 ## Tests
 

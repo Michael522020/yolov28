@@ -17,15 +17,17 @@ from yolov28 import YOLO
 from yolov28.data import (
     DetectionDataset,
     flip_boxes,
+    image_to_tensor,
     letterbox,
     xywhn_to_xyxy,
 )
 from yolov28.export import export_onnx
 from yolov28.loss import DetectionLoss
-from yolov28.metrics import average_precision
+from yolov28.ema import ModelEMA
+from yolov28.metrics import PredictionStore, average_precision
 from yolov28.model import YOLOv28, load_checkpoint
 from yolov28.ops import ciou, task_aligned_assign
-from yolov28.train import TrainConfig, train_model
+from yolov28.train import TrainConfig, mosaic_this_epoch, train_model
 
 
 def test_geometry() -> None:
@@ -60,6 +62,47 @@ def test_assignment_fallback() -> None:
     )
     if int(fg.sum()) != 1 or int(target_cls[int(fg.nonzero()[0]), 0]) != 1:
         raise AssertionError("tiny ground truth did not receive a nearest anchor")
+
+
+def test_mosaic_ema_and_map(tmp: Path) -> None:
+    if mosaic_this_epoch(89, 100, True) is not True or mosaic_this_epoch(90, 100, True) is not False:
+        raise AssertionError("mosaic should stay on until the last 10% of a 100-epoch run")
+    if mosaic_this_epoch(0, 5, True) is not True or mosaic_this_epoch(0, 5, False) is not False:
+        raise AssertionError("short runs keep mosaic only when it is enabled")
+    root = tmp / "mosaic"
+    image_dir = root / "images" / "train"
+    label_dir = root / "labels" / "train"
+    image_dir.mkdir(parents=True)
+    label_dir.mkdir(parents=True)
+    for name, color in (("a", (255, 0, 0)), ("b", (0, 255, 0)), ("c", (0, 0, 255)), ("d", (255, 255, 0))):
+        Image.new("RGB", (48, 36), color).save(image_dir / f"{name}.jpg")
+        (label_dir / f"{name}.txt").write_text("0 0.5 0.5 0.6 0.6\n", encoding="utf-8")
+    dataset = DetectionDataset(root, "images/train", imgsz=64, augment=True, nc=1, mosaic=True)
+    image, boxes = dataset._mosaic(0)
+    tensor = image_to_tensor(image)
+    if tensor.shape != (3, 64, 64) or boxes.ndim != 2 or boxes.shape[1] != 5 or boxes.shape[0] < 1:
+        raise AssertionError(f"mosaic sample mismatch {tensor.shape} {boxes.shape}")
+    if float(boxes[:, 1:5].min()) < 0 or float(boxes[:, 1:5].max()) > 64:
+        raise AssertionError("mosaic boxes left the canvas")
+    model = YOLOv28(nc=2, scale="n")
+    if not torch.allclose(model.p3_gate.conv.bias, torch.full_like(model.p3_gate.conv.bias, 4.0)):
+        raise AssertionError("StripGate should start open")
+    ema = ModelEMA(model)
+    with torch.no_grad():
+        model.stem[0].conv.weight.add_(0.2)
+    before = ema.ema.stem[0].conv.weight.detach().clone()
+    ema.update(model)
+    if torch.allclose(before, ema.ema.stem[0].conv.weight):
+        raise AssertionError("EMA did not move after a weight update")
+    if torch.allclose(ema.ema.stem[0].conv.weight, model.stem[0].conv.weight):
+        raise AssertionError("EMA copied the raw weight instead of smoothing it")
+    store = PredictionStore(1)
+    store.update(
+        torch.tensor([[0.0, 0.0, 10.0, 10.0, 0.9, 0.0]]),
+        torch.tensor([[0.0, 0.0, 0.0, 10.0, 10.0]]),
+    )
+    if abs(store.compute(0.5) - 1.0) > 1e-5 or abs(store.compute_range() - 1.0) > 1e-5:
+        raise AssertionError("a perfect box should score 1 at every IoU threshold")
 
 
 def test_forward_and_backward() -> None:
@@ -178,6 +221,8 @@ def math_isfinite(value: float) -> bool:
 def main() -> None:
     test_geometry()
     test_assignment_fallback()
+    with tempfile.TemporaryDirectory() as directory:
+        test_mosaic_ema_and_map(Path(directory))
     test_forward_and_backward()
     test_overfit_one_batch()
     with tempfile.TemporaryDirectory() as directory:

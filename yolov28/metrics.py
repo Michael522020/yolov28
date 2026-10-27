@@ -1,4 +1,4 @@
-"""Validation loss and a single-threshold mAP50."""
+"""Validation loss, mAP50, and mAP50-95."""
 
 from __future__ import annotations
 
@@ -86,6 +86,28 @@ class MapAccumulator:
         return float(sum(values) / len(values))
 
 
+class PredictionStore:
+    """Keep detections and ground truth, then score them at one or more IoU thresholds."""
+
+    def __init__(self, nc: int):
+        self.nc = nc
+        self.rows: List[tuple] = []
+
+    def update(self, detections: torch.Tensor, gt: torch.Tensor) -> None:
+        self.rows.append((detections.detach().cpu(), gt.detach().cpu()))
+
+    def compute(self, iou_thres: float = 0.5) -> float:
+        accumulator = MapAccumulator(self.nc)
+        for detections, gt in self.rows:
+            accumulator.update(detections, gt, iou_thres)
+        return accumulator.compute()
+
+    def compute_range(self) -> float:
+        thresholds = [round(0.50 + 0.05 * index, 2) for index in range(10)]
+        scores = [self.compute(threshold) for threshold in thresholds]
+        return float(sum(scores) / len(scores))
+
+
 @torch.no_grad()
 def evaluate(
     model: YOLOv28,
@@ -101,8 +123,8 @@ def evaluate(
     model.eval()
     loss_sum = 0.0
     seen = 0
-    many = MapAccumulator(model.nc)
-    one = MapAccumulator(model.nc)
+    many = PredictionStore(model.nc)
+    one = PredictionStore(model.nc)
     for images, targets in loader:
         images = images.to(device)
         targets = [target.to(device) for target in targets]
@@ -115,11 +137,12 @@ def evaluate(
         det_one = decode_detections(model, preds, conf, iou_thres, max_det, end2end=True)
         for index in range(batch):
             gt = targets[index]
-            many.update(det_many[index], gt, match_iou)
-            one.update(det_one[index], gt, match_iou)
+            many.update(det_many[index], gt)
+            one.update(det_one[index], gt)
     model.train(training)
     return {
         "loss": loss_sum / max(seen, 1),
-        "map50": many.compute(),
-        "map50_e2e": one.compute(),
+        "map50": many.compute(match_iou),
+        "map50_95": many.compute_range(),
+        "map50_e2e": one.compute(match_iou),
     }

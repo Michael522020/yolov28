@@ -19,9 +19,12 @@ from yolov28.data import (
     demo_names,
     load_data_config,
 )
+from yolov28.ema import ModelEMA
 from yolov28.loss import DetectionLoss
 from yolov28.metrics import evaluate
 from yolov28.model import YOLOv28, count_parameters, load_checkpoint
+
+VERSION = "0.2.0"
 
 
 @dataclass
@@ -42,6 +45,7 @@ class TrainConfig:
     log_every: int = 20
     nc: int | None = None
     weights: str = ""
+    mosaic: bool = True
 
 
 def select_device(name: str) -> torch.device:
@@ -79,6 +83,15 @@ def next_run_dir(project: str, name: str) -> Path:
     return root / f"{name}{index}"
 
 
+def mosaic_this_epoch(epoch: int, epochs: int, enabled: bool) -> bool:
+    """Keep mosaic on for short runs. On longer runs, drop it for the last 10%."""
+    if not enabled:
+        return False
+    if epochs < 10:
+        return True
+    return epoch < epochs - max(epochs // 10, 1)
+
+
 def save_checkpoint(path: Path, model: YOLOv28, names: dict, epoch: int) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(
@@ -88,6 +101,7 @@ def save_checkpoint(path: Path, model: YOLOv28, names: dict, epoch: int) -> None
             "scale": model.scale,
             "names": names,
             "epoch": epoch,
+            "version": VERSION,
         },
         path,
     )
@@ -123,9 +137,11 @@ def train_model(cfg: TrainConfig, model: YOLOv28 | None = None) -> dict:
         root, train_split, val_split, names, nc = load_data_config(cfg.data)
         if cfg.nc is not None and cfg.nc != nc:
             raise ValueError(f"--nc {cfg.nc} does not match the dataset nc {nc}")
-        train_set = DetectionDataset(root, train_split, cfg.imgsz, augment=True, nc=nc)
+        train_set = DetectionDataset(
+            root, train_split, cfg.imgsz, augment=True, nc=nc, mosaic=cfg.mosaic
+        )
         val_set = (
-            DetectionDataset(root, val_split, cfg.imgsz, augment=False, nc=nc)
+            DetectionDataset(root, val_split, cfg.imgsz, augment=False, nc=nc, mosaic=False)
             if val_split
             else None
         )
@@ -146,16 +162,20 @@ def train_model(cfg: TrainConfig, model: YOLOv28 | None = None) -> dict:
     model.to(device)
     criterion = DetectionLoss(model)
     optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
+    ema = ModelEMA(model)
     generator = torch.Generator()
     generator.manual_seed(cfg.seed)
-    train_loader = DataLoader(
-        train_set,
-        batch_size=cfg.batch,
-        shuffle=True,
-        num_workers=cfg.workers,
-        collate_fn=collate,
-        generator=generator,
-    )
+
+    def make_train_loader() -> DataLoader:
+        return DataLoader(
+            train_set,
+            batch_size=cfg.batch,
+            shuffle=True,
+            num_workers=cfg.workers,
+            collate_fn=collate,
+            generator=generator,
+        )
+
     val_loader = (
         None
         if val_set is None
@@ -172,11 +192,13 @@ def train_model(cfg: TrainConfig, model: YOLOv28 | None = None) -> dict:
     weight_dir = save_dir / "weights"
     weight_dir.mkdir(parents=True, exist_ok=True)
     log_path = save_dir / "results.csv"
-    log_path.write_text("epoch,train_loss,val_loss,map50,map50_e2e\n", encoding="utf-8")
+    log_path.write_text(
+        "epoch,train_loss,val_loss,map50,map50_95,map50_e2e\n", encoding="utf-8"
+    )
 
     print(
-        f"YOLOv28-{model.scale}  nc={model.nc}  params={count_parameters(model):,}  "
-        f"device={device}  imgsz={cfg.imgsz}"
+        f"YOLOv28-{model.scale} {VERSION}  nc={model.nc}  params={count_parameters(model):,}  "
+        f"device={device}  imgsz={cfg.imgsz}  mosaic={cfg.mosaic and not cfg.demo}"
     )
     print("Unofficial random initialization. This checkpoint is not a COCO pretrained model.")
     print(f"run directory: {save_dir}")
@@ -186,10 +208,13 @@ def train_model(cfg: TrainConfig, model: YOLOv28 | None = None) -> dict:
     last_path = weight_dir / "last.pt"
 
     for epoch in range(cfg.epochs):
+        if not cfg.demo:
+            train_set.mosaic = mosaic_this_epoch(epoch, cfg.epochs, cfg.mosaic)
         lr = learning_rate(epoch, cfg.epochs, cfg.lr)
         for group in optimizer.param_groups:
             group["lr"] = lr
         model.train()
+        train_loader = make_train_loader()
         running = 0.0
         seen = 0
         for step, (images, targets) in enumerate(train_loader, start=1):
@@ -200,6 +225,7 @@ def train_model(cfg: TrainConfig, model: YOLOv28 | None = None) -> dict:
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=10.0)
             optimizer.step()
+            ema.update(model)
             batch = images.shape[0]
             running += float(loss.detach()) * batch
             seen += batch
@@ -212,27 +238,31 @@ def train_model(cfg: TrainConfig, model: YOLOv28 | None = None) -> dict:
         train_loss = running / max(seen, 1)
         val_loss = ""
         map50 = ""
+        map50_95 = ""
         map50_e2e = ""
         score = -train_loss
         if val_loader is not None:
-            stats = evaluate(model, val_loader, criterion, device)
+            stats = evaluate(ema.ema, val_loader, criterion, device)
             val_loss = f"{stats['loss']:.6f}"
             map50 = f"{stats['map50']:.6f}"
+            map50_95 = f"{stats['map50_95']:.6f}"
             map50_e2e = f"{stats['map50_e2e']:.6f}"
-            score = stats["map50"]
+            score = stats["map50_95"]
             print(
                 f"epoch {epoch + 1}/{cfg.epochs} train {train_loss:.4f} "
                 f"val {stats['loss']:.4f} mAP50 {stats['map50']:.4f} "
-                f"mAP50-e2e {stats['map50_e2e']:.4f}"
+                f"mAP50-95 {stats['map50_95']:.4f} mAP50-e2e {stats['map50_e2e']:.4f}"
             )
         else:
             print(f"epoch {epoch + 1}/{cfg.epochs} train {train_loss:.4f}")
         with log_path.open("a", encoding="utf-8") as handle:
-            handle.write(f"{epoch + 1},{train_loss:.6f},{val_loss},{map50},{map50_e2e}\n")
-        save_checkpoint(last_path, model, names, epoch + 1)
+            handle.write(
+                f"{epoch + 1},{train_loss:.6f},{val_loss},{map50},{map50_95},{map50_e2e}\n"
+            )
+        save_checkpoint(last_path, ema.ema, names, epoch + 1)
         if score > best_score:
             best_score = score
-            save_checkpoint(best_path, model, names, epoch + 1)
+            save_checkpoint(best_path, ema.ema, names, epoch + 1)
 
     return {
         "last": last_path,
@@ -263,6 +293,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--log-every", type=int, default=20)
     parser.add_argument("--nc", type=int, default=None, help="class count for --demo; dataset yaml sets this otherwise")
     parser.add_argument("--weights", default="", help="optional checkpoint to continue from")
+    parser.add_argument("--no-mosaic", action="store_true", help="disable mosaic on a real dataset")
     return parser
 
 
@@ -284,6 +315,7 @@ def config_from_args(args: argparse.Namespace) -> TrainConfig:
         log_every=args.log_every,
         nc=args.nc,
         weights=args.weights,
+        mosaic=not args.no_mosaic,
     )
 
 

@@ -1,6 +1,6 @@
 [project]
 name = "yolov28"
-version = "0.1.0"
+version = "0.2.0"
 description = "Unofficial independent anchor-free detector. Not affiliated with Ultralytics."
 readme = "README.md"
 requires-python = ">=3.9"
